@@ -1,9 +1,6 @@
 import express from "express";
 import cors from "cors";
 import fetch from "node-fetch";
-import { Connection, PublicKey, SystemProgram, Keypair, Transaction } from "@solana/web3.js";
-import { TOKEN_PROGRAM_ID, createTransferInstruction } from "@solana/spl-token";
-import bs58 from "bs58";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -193,6 +190,9 @@ Approve details:
  * TELEGRAM WEBHOOK HANDLER
  *************************************************/
 app.post("/telegramWebhook", async (req, res) => {
+  // 👇 This log shows you exactly what Telegram sends
+  console.log("Received Telegram update:", JSON.stringify(req.body, null, 2));
+
   const update = req.body;
 
   if (update.callback_query) {
@@ -242,3 +242,4 @@ app.post("/telegramWebhook", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
+
